@@ -51,7 +51,6 @@ class RMSNorm(CustomOp):
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-
         if residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
@@ -128,12 +127,21 @@ class Gemma3RMSNorm(nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        if residual is not None:
+            x = x + residual
+            residual = x
+
         output = self._norm(x.float())
         # Llama does x.to(float16) * w whilst Gemma3 is (x * w).to(float16)
         # See https://github.com/huggingface/transformers/pull/29402
         output = output * (1.0 + self.weight.float())
-        return output.type_as(x)
+        output = output.type_as(x)
+        return output if residual is None else (output, residual)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.eps}"

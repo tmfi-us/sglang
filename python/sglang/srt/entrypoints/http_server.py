@@ -233,15 +233,19 @@ async def generate_request(obj: GenerateReqInput, request: Request):
                 async for out in _global_state.tokenizer_manager.generate_request(
                     obj, request
                 ):
-                    yield b"data: " + orjson.dumps(
-                        out, option=orjson.OPT_NON_STR_KEYS
-                    ) + b"\n\n"
+                    yield (
+                        b"data: "
+                        + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                        + b"\n\n"
+                    )
             except ValueError as e:
                 out = {"error": {"message": str(e)}}
                 logger.error(f"Error: {e}")
-                yield b"data: " + orjson.dumps(
-                    out, option=orjson.OPT_NON_STR_KEYS
-                ) + b"\n\n"
+                yield (
+                    b"data: "
+                    + orjson.dumps(out, option=orjson.OPT_NON_STR_KEYS)
+                    + b"\n\n"
+                )
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -376,9 +380,11 @@ async def dump_expert_distribution_record_async():
 @app.post("/update_weights_from_disk")
 async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: Request):
     """Update the weights from disk inplace without re-launching the server."""
-    success, message, num_paused_requests = (
-        await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
-    )
+    (
+        success,
+        message,
+        num_paused_requests,
+    ) = await _global_state.tokenizer_manager.update_weights_from_disk(obj, request)
     content = {
         "success": success,
         "message": message,
@@ -416,10 +422,11 @@ async def update_weights_from_distributed(
     obj: UpdateWeightsFromDistributedReqInput, request: Request
 ):
     """Update model parameter from distributed online."""
-    success, message = (
-        await _global_state.tokenizer_manager.update_weights_from_distributed(
-            obj, request
-        )
+    (
+        success,
+        message,
+    ) = await _global_state.tokenizer_manager.update_weights_from_distributed(
+        obj, request
     )
     content = {"success": success, "message": message}
     if success:
@@ -778,21 +785,21 @@ def _wait_and_warmup(
         ).tolist()
         json_data["sampling_params"]["max_new_tokens"] = 0
 
-    try:
-        res = requests.post(
-            url + request_name,
-            json=json_data,
-            headers=headers,
-            timeout=600,
-        )
-        assert res.status_code == 200, f"{res}"
-    except Exception:
-        last_traceback = get_exception_traceback()
-        if pipe_finish_writer is not None:
-            pipe_finish_writer.send(last_traceback)
-        logger.error(f"Initialization failed. warmup error: {last_traceback}")
-        kill_process_tree(os.getpid())
-        return
+    # try:
+    #     res = requests.post(
+    #         url + request_name,
+    #         json=json_data,
+    #         headers=headers,
+    #         timeout=600,
+    #     )
+    #     assert res.status_code == 200, f"{res}"
+    # except Exception:
+    #     last_traceback = get_exception_traceback()
+    #     if pipe_finish_writer is not None:
+    #         pipe_finish_writer.send(last_traceback)
+    #     logger.error(f"Initialization failed. warmup error: {last_traceback}")
+    #     kill_process_tree(os.getpid())
+    #     return
 
     # Debug print
     # logger.info(f"{res.json()=}")

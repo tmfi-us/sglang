@@ -37,14 +37,24 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb, get_rope
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weights_loader import AutoWeightsLoader
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.utils import add_prefix, make_layers
+
+
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    return config.sliding_window - 1
 
 
 # Adapted from:
@@ -170,7 +180,7 @@ class Gemma3Attention(nn.Module):
             self.rope_scaling = {"rope_type": "default"}
             # FIXME(mick): idk why vllm does this
             # self.sliding_window = config.interleaved_sliding_window
-            self.sliding_window = config.sliding_window
+            self.sliding_window = get_attention_sliding_window_size(config)
         else:
             # Global attention. Use the values in config.json.
             self.rope_theta = config.rope_theta
@@ -189,8 +199,17 @@ class Gemma3Attention(nn.Module):
         )
 
         # Gemma3 adds normalization for q and k
-        self.q_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Gemma3RMSNorm(dim=config.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Gemma3RMSNorm(dim=self.head_dim, eps=config.rms_norm_eps)
+
+        self.rotary_emb = get_rope(
+            self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=max_position_embeddings,
+            base=self.rope_theta,
+            is_neox_style=True,
+            rope_scaling=self.rope_scaling,
+        )
 
     def naive_attn_with_masks(
         self,
@@ -241,8 +260,8 @@ class Gemma3Attention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        forward_batch: ForwardBatch,
+        positions: torch.Tensor,
+        # position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
@@ -252,22 +271,44 @@ class Gemma3Attention(nn.Module):
         # [s, h, head_dim]
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         # -> [h, s, head_dim]
-        q = q.transpose(0, 1).unsqueeze(0)
+        # q = q.transpose(0, 1).unsqueeze(0)
         q = self.q_norm(q)
+        q = q.flatten(-2, -1)
         k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         # -> [h, s, head_dim]
-        k = k.transpose(0, 1).unsqueeze(0)
+        # k = k.transpose(0, 1).unsqueeze(0)
         k = self.k_norm(k)
+        k = k.flatten(-2, -1)
 
-        # q, k = self.rotary_emb(positions, q, k)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        print("Gemma3Attention::before rotary_emb positions", positions)
+        print("Gemma3Attention::before rotary_emb q", q)
+        print("Gemma3Attention::before rotary_emb k", k)
+
+        q, k = self.rotary_emb(positions, q, k)
+
+        print("Gemma3Attention::after rotary_emb q", q)
+        print("Gemma3Attention::after rotary_emb k", k)
+
+        # cos, sin = position_embeddings
+        # q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        attn_output = self.attn(q, k, v, **kwargs)
+
+        print("Gemma3Attention::after attn attn_output", attn_output)
+
+        if not kwargs.get("has_images", False):
+            output, _ = self.o_proj(attn_output)
+
+            print("Gemma3Attention::after no_image o_proj output", output)
+
+            return output
 
         # [b, h, s, head_dim] ->  [b, s, h, head_dim]
-        q = q.permute(0, 2, 1, 3)
-        k = k.permute(0, 2, 1, 3)
+        # q = q.permute(0, 2, 1, 3)
+        # k = k.permute(0, 2, 1, 3)
 
-        attn_output = self.attn(q, k, v, forward_batch=forward_batch)
+        attn_output = self.naive_attn_with_masks(q, k, v, out=attn_output, **kwargs)
+        # attn_output = self.attn(q, k, v, forward_batch=forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -281,6 +322,7 @@ class Gemma3DecoderLayer(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_name = prefix
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma3Attention(
             layer_id=layer_id,
@@ -316,41 +358,75 @@ class Gemma3DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        position_embeddings_global: torch.Tensor,
-        position_embeddings_local: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        # position_embeddings_global: torch.Tensor,
+        # position_embeddings_local: torch.Tensor,
         forward_batch: ForwardBatch,
         **kwargs,
     ) -> tuple[
         torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
     ]:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states,
+                residual,
+            )
+
+        print("Gemma3DecoderLayer::before self_attn hidden_states", hidden_states)
+        print("Gemma3DecoderLayer::before self_attn residual", residual)
 
         # apply global RoPE to non-sliding layer only
-        if self.self_attn.is_sliding:
-            position_embeddings = position_embeddings_local
-        else:
-            position_embeddings = position_embeddings_global
+        # if self.self_attn.is_sliding:
+        #     position_embeddings = position_embeddings_local
+        # else:
+        #     position_embeddings = position_embeddings_global
 
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
-            position_embeddings=position_embeddings,
+            # position_embeddings=position_embeddings,
             forward_batch=forward_batch,
             **kwargs,
         )
+
+        print("Gemma3DecoderLayer::after self_attn hidden_states", hidden_states)
+
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
 
-        residual = hidden_states
-        hidden_states = self.pre_feedforward_layernorm(hidden_states)
+        print(
+            "Gemma3DecoderLayer::after post_attention_layernorm hidden_states",
+            hidden_states,
+        )
+
+        # hidden_states = residual + hidden_states
+
+        # residual = hidden_states
+        hidden_states, residual = self.pre_feedforward_layernorm(
+            hidden_states, residual
+        )
+
+        print(
+            "Gemma3DecoderLayer::after pre_feedforward_layernorm hidden_states",
+            hidden_states,
+        )
+        print("Gemma3DecoderLayer::after pre_feedforward_layernorm residual", residual)
+
         hidden_states = self.mlp(hidden_states)
+
+        print("Gemma3DecoderLayer::after mlp hidden_states", hidden_states)
+
         hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = residual + hidden_states
+        # hidden_states = residual + hidden_states
 
-        outputs = (hidden_states,)
+        print(
+            "Gemma3DecoderLayer::after post_feedforward_layernorm hidden_states",
+            hidden_states,
+        )
 
-        return outputs
+        return hidden_states, residual
 
 
 class Gemma3RotaryEmbedding(nn.Module):
@@ -431,7 +507,7 @@ class Gemma3RotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-class Gemma3TextScaledWordEmbedding(nn.Embedding):
+class Gemma3TextScaledWordEmbedding(VocabParallelEmbedding):
     """
     This module overrides nn.Embeddings' forward by multiplying with embeddings scale.
     """
@@ -440,14 +516,19 @@ class Gemma3TextScaledWordEmbedding(nn.Embedding):
         self,
         num_embeddings: int,
         embedding_dim: int,
-        padding_idx: int,
         embed_scale: Optional[float] = 1.0,
     ):
-        super().__init__(num_embeddings, embedding_dim, padding_idx)
-        self.embed_scale = embed_scale
+        super().__init__(num_embeddings, embedding_dim)
+        self.register_buffer("normalizer", torch.tensor(embed_scale))
+        # self.embed_scale = embed_scale
 
     def forward(self, input_ids: torch.Tensor):
-        return super().forward(input_ids) * self.embed_scale
+        print("get_input_embeddings input_ids", input_ids)
+        print("get_input_embeddings normalizer", self.normalizer)
+        import traceback
+
+        traceback.print_stack()
+        return super().forward(input_ids) * self.normalizer
 
 
 class Gemma3TextModel(PreTrainedModel):
@@ -468,19 +549,18 @@ class Gemma3TextModel(PreTrainedModel):
         self.embed_tokens = Gemma3TextScaledWordEmbedding(
             config.vocab_size,
             config.hidden_size,
-            self.padding_idx,
             embed_scale=self.config.hidden_size**0.5,
         )
 
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Gemma3RotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
+        # self.rotary_emb = Gemma3RotaryEmbedding(config=config)
+        # self.gradient_checkpointing = False
 
         # when we want to create a local RoPE layer. Config defaults should hold values for global RoPE
-        config = copy.deepcopy(config)
-        config.rope_theta = config.rope_local_base_freq
-        config.rope_scaling = {"rope_type": "default"}
-        self.rotary_emb_local = Gemma3RotaryEmbedding(config=config)
+        # lconfig = copy.deepcopy(config)
+        # lconfig.rope_theta = lconfig.rope_local_base_freq
+        # lconfig.rope_scaling = {"rope_type": "default"}
+        # self.rotary_emb_local = Gemma3RotaryEmbedding(config=lconfig)
 
         self.layers = make_layers(
             config.num_hidden_layers,
@@ -503,30 +583,101 @@ class Gemma3TextModel(PreTrainedModel):
         input_embeds: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
+        print("forward req input_ids", input_ids)
+        print("forward req input_embeds", input_embeds)
+
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+        residual = None
 
-        if positions.dim() == 1:
-            positions = einops.rearrange(positions, "s -> 1 s")
+        print("forward req hidden_states", hidden_states)
+        print("forward req residual", residual)
 
-        position_embeddings_global = self.rotary_emb(hidden_states, positions)
-        position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
+        # if positions.dim() == 1:
+        #     positions = einops.rearrange(positions, "s -> 1 s")
+
+        # position_embeddings_global = self.rotary_emb(hidden_states, positions)
+        # position_embeddings_local = self.rotary_emb_local(hidden_states, positions)
         for layer in self.layers:
-            layer_outputs = layer(
+            print(f"layer: {layer.layer_name}")
+            # print(f"before forward residual: {residual}")
+            hidden_states, residual = layer(
                 positions=positions,
-                position_embeddings_global=position_embeddings_global,
-                position_embeddings_local=position_embeddings_local,
+                # position_embeddings_global=position_embeddings_global,
+                # position_embeddings_local=position_embeddings_local,
                 hidden_states=hidden_states,
+                residual=residual,
                 forward_batch=forward_batch,
                 **kwargs,
             )
-            hidden_states = layer_outputs[0]
+            print("forward layer hidden_states", hidden_states)
+            print("forward layer residual", residual)
+            # print(f"after forward residual: {residual}")
+            # hidden_states = layer_outputs[0]
 
-        hidden_states = self.norm(hidden_states)
+        print("forward res hidden_states", hidden_states)
+        print("forward res residual", residual)
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        print("forward norm hidden_states", hidden_states)
 
         return hidden_states
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+        print("Loading weights for Gemma3TextModel")
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("qkv_proj", "q_proj", "q"),
+            ("qkv_proj", "k_proj", "k"),
+            ("qkv_proj", "v_proj", "v"),
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: Set[str] = set()
+        for name, loaded_weight in weights:
+            if self.quant_config is not None and (
+                scale_name := self.quant_config.get_cache_scale(name)
+            ):
+                # Loading kv cache scales for compressed-tensors quantization
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                loaded_weight = loaded_weight[0]
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+            for param_name, shard_name, shard_id in stacked_params_mapping:
+                if shard_name not in name:
+                    continue
+                name = name.replace(shard_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # if is_pp_missing_parameter(name, self):
+                #     continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                # Remapping the name of FP8 kv-scale.
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                # if is_pp_missing_parameter(name, self):
+                #     continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+            loaded_params.add(name)
+
+        return loaded_params
 
 
 class Gemma3ForCausalLM(PreTrainedModel):
@@ -595,19 +746,22 @@ class Gemma3ForCausalLM(PreTrainedModel):
         )
         self.logits_processor = LogitsProcessor(config)
 
-        if self.config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+        # if self.config.tie_word_embeddings:
+        #     self.lm_head = self.model.embed_tokens
+        # else:
+        #     self.lm_head = ParallelLMHead(
+        #         config.vocab_size,
+        #         config.hidden_size,
+        #         quant_config=quant_config,
+        #         prefix=add_prefix("lm_head", prefix),
+        #     )
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
@@ -621,7 +775,6 @@ class Gemma3ForCausalLM(PreTrainedModel):
         input_embeds: torch.Tensor = None,
         **kwargs,
     ) -> LogitsProcessor:
-
         hidden_states = self.model(
             input_ids, positions, forward_batch, input_embeds, **kwargs
         )
@@ -631,53 +784,11 @@ class Gemma3ForCausalLM(PreTrainedModel):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
-        params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-        for name, loaded_weight in weights:
-            for param_name, shard_name, shard_id in stacked_params_mapping:
-                # if param_name in name:
-                # print(f"{param_name} is already in {name}")
-                if shard_name not in name:
-                    continue
-                name = name.replace(shard_name, param_name)
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                # lm_head is not used in vllm as it is tied with embed_token.
-                # To prevent errors, skip loading lm_head.weight.
-                if "lm_head.weight" in name:
-                    continue
-                # Skip loading extra bias for GPTQ models.
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale.
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        # unloaded_params = params_dict.keys() - loaded_params
-        # if unloaded_params:
-        #     logger.warning(
-        #         "Some weights are not initialized from checkpoints: %s", unloaded_params
-        #     )
-        return loaded_params
+        print("Loading weights for Gemma3ForCausalLM")
+        return AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        ).load_weights(weights)
 
 
 EntryClass = Gemma3ForCausalLM

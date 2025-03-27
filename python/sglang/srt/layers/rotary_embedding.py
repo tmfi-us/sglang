@@ -1,6 +1,7 @@
 # Adapted from https://raw.githubusercontent.com/vllm-project/vllm/refs/tags/v0.6.6.post1/vllm/model_executor/layers/rotary_embedding.py
 
 """Rotary Positional Embeddings."""
+
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -119,6 +120,7 @@ class RotaryEmbedding(CustomOp):
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """A PyTorch-native implementation of forward()."""
+        print("ROTARY EMBEDDING NATIVE")
         if offsets is not None:
             positions = positions + offsets
         positions = positions.flatten()
@@ -148,7 +150,10 @@ class RotaryEmbedding(CustomOp):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(positions, query, key, offsets)
+        print("ROTARY EMBEDDING CUDA")
         if _is_cuda_available and (self.head_size in [64, 128, 256, 512]):
+            print("APPLY_ROPE_WITH_COS_SIN_CACHE_INPLACE")
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -158,6 +163,7 @@ class RotaryEmbedding(CustomOp):
                 is_neox=self.is_neox_style,
             )
         else:
+            print("OPS.ROTARY_EMBEDDING")
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
             ops.rotary_embedding(
                 positions,
@@ -687,7 +693,6 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
-
     def __init__(
         self,
         head_size: int,
@@ -1188,9 +1193,9 @@ def get_rope_cpu(
 
     assert rope_scaling is not None
     scaling_type = rope_scaling["rope_type"]
-    assert (
-        scaling_type == "deepseek_yarn"
-    ), "Only deepseek_yarn is supported for CPU for now"
+    assert scaling_type == "deepseek_yarn", (
+        "Only deepseek_yarn is supported for CPU for now"
+    )
 
     scaling_factor = rope_scaling["factor"]
     original_max_position = rope_scaling["original_max_position_embeddings"]

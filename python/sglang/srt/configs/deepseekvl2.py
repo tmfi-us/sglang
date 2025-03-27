@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-import torchvision.transforms as T
 from PIL import Image, ImageOps
 from transformers import (
     AutoProcessor,
@@ -76,6 +75,7 @@ class ImageTransform(object):
         self.std = std
         self.normalize = normalize
 
+        import torchvision.transforms as T
         transform_pipelines = [T.ToTensor()]
 
         if normalize:

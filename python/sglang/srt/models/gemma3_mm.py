@@ -40,10 +40,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
+from sglang.srt.model_loader.weights_loader import AutoWeightsLoader
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.utils import add_prefix
 
@@ -177,11 +174,15 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
         # Text model
         self.language_model = Gemma3ForCausalLM(
-            config.text_config, quant_config, prefix=add_prefix("model", prefix)
+            config.text_config,
+            quant_config,
+            prefix=add_prefix("language_model", prefix),
         )
-        if self.language_model.logits_processor.logit_scale:
-            logit_scale = getattr(config, "logit_scale", 1.0)
-            self.language_model.logits_processor.logit_scale *= logit_scale
+        # if self.language_model.logits_processor.logit_scale:
+        logit_scale = getattr(config, "logit_scale", 1.0)
+        print(f"logit_scale: {logit_scale}")
+        self.language_model.logits_processor.logit_scale = logit_scale
+
         self.post_init()
 
     def pad_input_ids(
@@ -267,6 +268,9 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
+
+    def get_attention_sliding_window_size(self):
+        return self.language_model.get_attention_sliding_window_size()
 
     def get_image_feature(self, image_input: MultimodalInputs):
         """
@@ -389,7 +393,7 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
 
         # Important: position_ids in Gemma3 are 1-indexed
         # This really does cost me sometime
-        positions += 1
+        # positions += 1
 
         # Replace image id with PAD if the image token if OOV, to avoid index-errors
         if input_ids is not None and self.config.image_token_index >= self.vocab_size:
@@ -420,41 +424,8 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for the model."""
-        params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
-
-        for name, loaded_weight in weights:
-            if "language_model" in name:
-                # Gemma3ForCausalLM.load_weights(self, [(name.replace("language_model.", ""), loaded_weight)])
-                causal_loaded_params = Gemma3ForCausalLM.load_weights(
-                    self, [(name, loaded_weight)]
-                )
-                loaded_params.update(causal_loaded_params)
-                continue
-            else:
-                # Skip lm_head.weight as it's tied with embed_tokens
-                if "lm_head.weight" in name:
-                    continue
-
-                # Skip loading extra bias for GPTQ models
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-
-                # Remapping the name of FP8 kv-scale
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            pass
-            # raise RuntimeError(
-            #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
-        return loaded_params
+        print("Loading weights for Gemma3ForConditionalGeneration")
+        return AutoWeightsLoader(self).load_weights(weights)
 
 
 EntryClass = Gemma3ForConditionalGeneration
